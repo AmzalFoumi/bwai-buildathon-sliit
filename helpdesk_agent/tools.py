@@ -7,54 +7,101 @@ import os
 from typing import Literal
 
 # ── Data Loading ──────────────────────────────────────────────────────────────
+# Paths and constants used to locate and parse the laptop catalogue CSV.
 
 _DATA_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _CSV_PATH = os.path.join(_DATA_DIR, "laptop_dataset_final.csv")
 
-# Laptop usage categories based on hardware characteristics
+# -- Intent-matching keyword lists ---------------------------------------------
+# These lists define the hardware patterns that help us classify laptops
+# into usage categories (gaming, business, etc.).
+
+# Dedicated GPU substrings → a laptop is likely capable of gaming / 3D work
 _GAMING_KEYWORDS = [
     "nvidia geforce rtx", "nvidia geforce gtx", "nvidia quadro",
     "amd radeon rx", "amd radeon pro",
 ]
+
+# Laptop series that are designed for business / enterprise use
 _BUSINESS_KEYWORDS = [
     "thinkpad", "elitebook", "probook", "latitude", "precision",
 ]
+
+# Weight (kg) below which a laptop is considered thin-and-light / ultraportable
 _THIN_AND_LIGHT_THRESHOLD = 1.6  # kg
 
 
+# ── Internal helpers ──────────────────────────────────────────────────────────
+# These functions are private to this module.  They handle data loading,
+# parsing raw CSV strings into numbers, and category classification.
+
+
 def _load_data() -> list[dict]:
-    """Load laptop records from the CSV file into a list of dicts."""
+    """Load laptop records from the CSV file into a list of dicts.
+
+    Each CSV row becomes one dict keyed by the column names.  Two synthetic
+    fields are added:
+      - ``_price``      → float  (normalised from "Price (Rs)")
+      - ``_weight_kg``  → float  (extracted from the "Weight" column)
+
+    Returns:
+        Every row from the CSV, including rows with missing prices.
+        Downstream tools filter those out when appropriate.
+    """
     rows: list[dict] = []
     with open(_CSV_PATH, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Normalise price
+            # Normalise price: strip whitespace, convert to float (default 0.0)
             raw = row.get("Price (Rs)", "").strip()
             row["_price"] = float(raw) if raw else 0.0
-            # Normalise weight (kg)
+
+            # Normalise weight: parse "1.41 Kg weight (Light-weight)" → 1.41
             w = row.get("Weight", "").strip().lower()
             row["_weight_kg"] = _parse_weight(w)
-            # Skip rows with no price (data gap) unless price is explicitly part of a search
+
             rows.append(row)
     return rows
 
 
 def _parse_weight(raw: str) -> float:
-    """Extract numeric weight in kilograms from a string like '1.41 Kg weight (Light-weight)'."""
+    """Extract numeric weight in kilograms from a string like ``'1.41 Kg weight'``.
+
+    Args:
+        raw: The raw Weight column value.
+
+    Returns:
+        Weight in kg, or 0.0 if no pattern matches.
+    """
+    # Look for a decimal number followed by whitespace and 'k' (case-insensitive).
     import re
     m = re.search(r"([\d.]+)\s*k", raw)
     return float(m.group(1)) if m else 0.0
 
 
 def _parse_display_size(raw: str) -> float:
-    """Extract numeric display size in inches from a string like '15.6 Inches (39.62 cm)'."""
+    """Extract numeric display size in inches from a string like ``'15.6 Inches (39.62 cm)'``.
+
+    Args:
+        raw: The raw Display Size column value.
+
+    Returns:
+        Diagonal size in inches, or 0.0 if no pattern matches.
+    """
     import re
     m = re.search(r"([\d.]+)\s*Inch", raw)
     return float(m.group(1)) if m else 0.0
 
 
 def _match_budget_category(price: float) -> str:
-    """Classify a laptop into a budget category."""
+    """Classify a price point into a human-friendly budget tier.
+
+    Args:
+        price: Price in Rupees.
+
+    Returns:
+        One of ``'budget'``, ``'mid-range'``, ``'premium'``, ``'ultra-premium'``.
+    """
     if price <= 35000:
         return "budget"
     elif price <= 65000:
@@ -65,8 +112,28 @@ def _match_budget_category(price: float) -> str:
         return "ultra-premium"
 
 
+# ── Intent classifier ─────────────────────────────────────────────────────────
+# ``_matches_intent`` uses simple keyword / threshold heuristics to decide
+# whether a laptop is suitable for a given use case.  This lets the agent
+# answer questions like "Which laptop is good for gaming?" without the
+# customer having to specify technical specs.
+
+
 def _matches_intent(row: dict, intent: str) -> bool:
-    """Heuristic check if a laptop matches a given usage intent."""
+    """Return ``True`` if *row* looks suitable for the given usage *intent*.
+
+    Heuristics are based on GPU, RAM, processor, weight, display size,
+    and known product series.  When no intent is matched the function
+    returns ``True`` (pass-through).
+
+    Args:
+        row: A single laptop record (augmented with ``_price``, ``_weight_kg``).
+        intent: Lower-cased usage keyword (e.g. ``'gaming'``, ``'student'``).
+
+    Returns:
+        Whether the laptop passes the intent filter.
+    """
+    # Cache frequently accessed fields so we only call .get() / .lower() once.
     intent = intent.lower()
     gpu = row.get("Graphic Processor", "").lower()
     brand = row.get("Brand", "").lower()
@@ -78,27 +145,39 @@ def _matches_intent(row: dict, intent: str) -> bool:
     display_size = _parse_display_size(row.get("Display Size", ""))
 
     # --- Gaming ---
+    # Requires a dedicated GPU (NVIDIA RTX/GTX or AMD Radeon RX/Pro) AND
+    # either ample RAM (≥16 GB) or a known gaming-series chassis.
     if intent in ("gaming", "game", "gamer"):
         has_dedicated_gpu = any(kw in gpu for kw in _GAMING_KEYWORDS)
-        has_gaming_series = any(kw in series for kw in ("gaming", "predator", "tuf", "rog", "legion", "omen", "victus"))
+        has_gaming_series = any(
+            kw in series
+            for kw in ("gaming", "predator", "tuf", "rog", "legion", "omen", "victus")
+        )
         good_ram = ram in ("16 GB", "32 GB", "64 GB")
         return has_dedicated_gpu and (good_ram or has_gaming_series)
 
     # --- Student / General Use ---
+    # Affordable (≤ Rs. 65 000) and reasonably portable (≤ 2.0 kg).
     if intent in ("student", "study", "college", "general"):
         good_price = row["_price"] <= 65000
         portable = weight <= 2.0
         return good_price and portable
 
     # --- Business / Office ---
+    # Known business series (ThinkPad, EliteBook, etc.) OR a combination of
+    # long battery life (column non-empty) and lightweight design.
     if intent in ("business", "office", "professional", "work"):
-        has_business_series = any(kw in series or kw in model for kw in _BUSINESS_KEYWORDS)
+        has_business_series = any(
+            kw in series or kw in model
+            for kw in _BUSINESS_KEYWORDS
+        )
         good_battery = row.get("Battery Life", "") != ""
         if has_business_series:
             return True
         return good_battery and weight <= 1.8
 
     # --- Creative / Content Creation ---
+    # Needs a dedicated GPU, ≥16 GB RAM, and a ≥15" display for detailed work.
     if intent in ("creative", "content creation", "design", "video editing", "photo editing"):
         has_dedicated_gpu = any(kw in gpu for kw in _GAMING_KEYWORDS)
         good_ram = ram in ("16 GB", "32 GB", "64 GB")
@@ -106,19 +185,28 @@ def _matches_intent(row: dict, intent: str) -> bool:
         return has_dedicated_gpu and good_ram and good_display
 
     # --- Portable / Lightweight ---
+    # Weight must be below the thin-and-light threshold (1.6 kg).
     if intent in ("portable", "lightweight", "thin", "ultrabook"):
         return weight <= _THIN_AND_LIGHT_THRESHOLD
 
     # --- Programming / Development ---
+    # Needs ≥16 GB RAM and a modern mid/high-end processor.
     if intent in ("programming", "development", "coding", "developer"):
         good_ram = ram in ("16 GB", "32 GB", "64 GB")
-        good_processor = any(kw in processor for kw in ("i5", "i7", "i9", "ryzen 5", "ryzen 7", "ryzen 9", "core ultra"))
+        good_processor = any(
+            kw in processor
+            for kw in ("i5", "i7", "i9", "ryzen 5", "ryzen 7", "ryzen 9", "core ultra")
+        )
         return good_ram and good_processor
 
-    return True  # no filter
+    # No intent matched → pass everything through
+    return True
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
+# Each function below is registered as a tool on the ADK agent.  They all
+# accept plain Python types and return serialisable dicts so the agent can
+# interpret the results.
 
 
 def search_laptops(
@@ -159,16 +247,22 @@ def search_laptops(
     data = _load_data()
     results: list[dict] = []
 
+    # ── Filter pipeline ────────────────────────────────────────────────────
+    # Each row is tested against every active filter.  Filters are AND-ed
+    # together so only rows that satisfy ALL criteria are kept.
+
     for row in data:
         # Skip rows with no valid price unless user explicitly searches by some non-price field
         if row["_price"] <= 0 and min_price is None and max_price is None:
             continue
 
-        # -- brand filter --
+        # -- Brand filter --
+        # Case-insensitive substring match on the Brand column.
         if brand and brand.lower() not in row.get("Brand", "").lower():
             continue
 
-        # -- price filters --
+        # -- Price filters --
+        # Both lower and upper bounds are optional; only those supplied are enforced.
         price = row["_price"]
         if min_price is not None and price < min_price:
             continue
@@ -176,40 +270,52 @@ def search_laptops(
             continue
 
         # -- RAM filter --
+        # Uses ``_capacity_gte`` to compare values like "8 GB" vs "16 GB" correctly.
         if min_ram:
             row_ram = row.get("Capacity", "").strip()
             if not _capacity_gte(row_ram, min_ram):
                 continue
 
         # -- Storage filter --
+        # Same comparison logic for SSD capacity.
         if min_storage:
             row_storage = row.get("SSD Capacity", "").strip()
             if not _capacity_gte(row_storage, min_storage):
                 continue
 
         # -- Processor keyword --
+        # Simple substring match on the Processor column (e.g. "i7", "Ryzen 5").
         if processor_keyword:
             if processor_keyword.lower() not in row.get("Processor", "").lower():
                 continue
 
         # -- Intent filter --
+        # Uses the heuristic classifier defined above.
         if intent and not _matches_intent(row, intent):
             continue
 
         results.append(row)
 
-    # -- Sorting --
+    # ── Sorting ────────────────────────────────────────────────────────────
+    # Sort the filtered results by the requested field and direction.
     if sort_by == "price":
         results.sort(key=lambda r: r["_price"], reverse=not ascending)
     elif sort_by == "ram":
-        results.sort(key=lambda r: _parse_capacity_gb(r.get("Capacity", "")), reverse=not ascending)
+        results.sort(
+            key=lambda r: _parse_capacity_gb(r.get("Capacity", "")),
+            reverse=not ascending,
+        )
     elif sort_by == "storage":
-        results.sort(key=lambda r: _parse_capacity_gb(r.get("SSD Capacity", "")), reverse=not ascending)
+        results.sort(
+            key=lambda r: _parse_capacity_gb(r.get("SSD Capacity", "")),
+            reverse=not ascending,
+        )
 
-    # -- Limit --
+    # ── Limit & summarise ──────────────────────────────────────────────────
     results = results[:limit]
 
-    # Build summary
+    # Compute a simple average price for the result set (useful for "how much
+    # will a decent gaming laptop cost?" questions).
     if results:
         prices = [r["_price"] for r in results]
         avg_price = sum(prices) / len(prices)
@@ -354,27 +460,40 @@ def compare_laptops(models: list[str]) -> dict:
     data = _load_data()
     found: list[dict] = []
 
+    # ── Model resolution ───────────────────────────────────────────────────
+    # For each user-supplied term we first try an exact (case-insensitive)
+    # match on the Model column.  If that fails, fall back to a substring
+    # match so that partial model numbers still work.
     for q in models:
         ql = q.lower().strip()
         match = None
+
+        # Attempt exact match first.
         for row in data:
             if row.get("Model", "").lower().strip() == ql:
                 match = row
                 break
+
+        # Fallback: partial (substring) match.
         if not match:
             for row in data:
                 if ql in row.get("Model", "").lower():
                     match = row
                     break
+
         if match:
             found.append(match)
 
+    # We need at least two matched models for a useful comparison.
     if len(found) < 2:
         return {
             "status": "error",
             "message": f"Could not find enough matching models. Found {len(found)} of {len(models)}.",
         }
 
+    # ── Build comparison table ─────────────────────────────────────────────
+    # Pick the most informative / frequently asked-about fields for
+    # a side-by-side comparison view.
     comparison_fields = [
         "Brand", "Model", "Series", "Price (Rs)", "Processor",
         "Capacity", "Graphic Processor", "SSD Capacity",
@@ -386,9 +505,13 @@ def compare_laptops(models: list[str]) -> dict:
 
     comparison_rows = []
     for laptop in found:
-        entry = {"name": f"{laptop.get('Brand', '')} {laptop.get('Model', '')}".strip()}
+        # Build a human-readable label like "Acer PHN16-71 (NH.QLTSI.002)".
+        entry = {
+            "name": f"{laptop.get('Brand', '')} {laptop.get('Model', '')}".strip()
+        }
         for field in comparison_fields:
             val = laptop.get(field, "").strip()
+            # Format the price column nicely with the Rs. prefix and locale grouping.
             if field == "Price (Rs)":
                 try:
                     val = f"Rs. {float(val):,.0f}" if val else "N/A"
@@ -434,10 +557,14 @@ def get_laptop_recommendations(
     """
     data = _load_data()
 
-    # Exclude records with no valid price
+    # ── Filtering pipeline ─────────────────────────────────────────────────
+    # Start by excluding records with no valid price, then progressively
+    # narrow the candidate pool.
+
+    # Exclude records with no valid price (data-quality gap).
     data = [r for r in data if r["_price"] > 0]
 
-    # Apply intent filter first
+    # Apply the usage-intent classifier first (this is the primary signal).
     candidates = [r for r in data if _matches_intent(r, primary_use)]
 
     if budget_max:
@@ -462,7 +589,11 @@ def get_laptop_recommendations(
             if r.get("Display Touchscreen", "").strip() == wanted
         ]
 
-    # Sort by a quality score: prefer more RAM, larger SSD, within budget
+    # ── Scoring & ranking ──────────────────────────────────────────────────
+    # We compute a simple quality score for each candidate that rewards:
+    #   • more RAM (weight 0.5)
+    #   • larger SSD (weight 0.3)
+    #   • price close to the budget ceiling (better value-for-money)
     def _score(l: dict) -> float:
         s = 0.0
         s += _parse_capacity_gb(l.get("Capacity", "")) * 0.5
@@ -504,18 +635,25 @@ def get_laptop_recommendations(
 def get_available_brands() -> dict:
     """List all laptop brands available in the catalogue with counts.
 
+    Useful as an initial "what do you have?" query so the agent can help
+    customers discover which manufacturers are stocked.
+
     Returns:
-        Sorted list of brands and how many models each has.
+        Sorted list of brands, model counts, and min/max price range per brand.
     """
     data = _load_data()
+
+    # ── Aggregate per brand ────────────────────────────────────────────────
     brand_count: dict[str, int] = {}
     brand_price_range: dict[str, dict] = {}
 
     for row in data:
         b = row.get("Brand", "").strip()
         if not b:
-            continue
+            continue  # skip rows with missing brand
+
         brand_count[b] = brand_count.get(b, 0) + 1
+
         p = row["_price"]
         if b not in brand_price_range:
             brand_price_range[b] = {"min": p, "max": p}
@@ -523,6 +661,7 @@ def get_available_brands() -> dict:
             brand_price_range[b]["min"] = min(brand_price_range[b]["min"], p)
             brand_price_range[b]["max"] = max(brand_price_range[b]["max"], p)
 
+    # ── Build response ─────────────────────────────────────────────────────
     brands_list = [
         {
             "brand": b,
@@ -532,7 +671,7 @@ def get_available_brands() -> dict:
                 "max": brand_price_range[b]["max"],
             },
         }
-        for b in sorted(brand_count.keys())
+        for b in sorted(brand_count.keys())  # alphabetical order
     ]
 
     return {
@@ -547,7 +686,14 @@ def get_available_brands() -> dict:
 
 
 def _parse_capacity_gb(raw: str) -> float:
-    """Convert a capacity string like '512 GB', '1 TB', '16 GB' to GB float."""
+    """Convert a capacity string like ``'512 GB'``, ``'1 TB'``, or ``'16 GB'`` to a float in GB.
+
+    Args:
+        raw: Human-readable capacity (e.g. ``"512 GB"``, ``"1 TB"``).
+
+    Returns:
+        Capacity in gigabytes, or ``0.0`` if the string cannot be parsed.
+    """
     import re
     raw = raw.strip().upper()
     m = re.match(r"([\d.]+)\s*(TB|GB|MB)", raw)
@@ -563,12 +709,34 @@ def _parse_capacity_gb(raw: str) -> float:
 
 
 def _capacity_gte(row_val: str, filter_val: str) -> bool:
-    """Check if row_val >= filter_val for capacities like '8 GB', '512 GB'."""
+    """Return ``True`` if *row_val* ≥ *filter_val*, parsing capacities sensibly.
+
+    This lets us compare values like ``"8 GB"`` vs ``"16 GB"`` or
+    ``"512 GB"`` vs ``"1 TB"`` without manual unit conversion.
+
+    Args:
+        row_val: Capacity from the dataset (e.g. ``"8 GB"``).
+        filter_val: User-supplied minimum (e.g. ``"16 GB"``).
+
+    Returns:
+        Whether the row meets or exceeds the requested minimum.
+    """
     return _parse_capacity_gb(row_val) >= _parse_capacity_gb(filter_val)
 
 
 def _summarise_laptop(row: dict) -> dict:
-    """Return a concise summary of a laptop for search results."""
+    """Return a concise summary of a laptop for use in search-result lists.
+
+    The summary omits niche fields (audio, connectivity, warranty details)
+    to keep the response lightweight and scannable.
+
+    Args:
+        row: A single laptop record.
+
+    Returns:
+        Dict with the most important specs (brand, model, CPU, RAM, storage,
+        GPU, display, weight, OS, price).
+    """
     return {
         "brand": row.get("Brand", ""),
         "model": row.get("Model", ""),
@@ -586,7 +754,19 @@ def _summarise_laptop(row: dict) -> dict:
 
 
 def _full_laptop_detail(row: dict) -> dict:
-    """Return the full detail record for a single laptop."""
+    """Return the complete detail record for a single laptop.
+
+    This is used by ``get_laptop_by_model`` and returns every scrap of
+    information we have about a laptop, organised into logical groups
+    (RAM, storage, graphics, display, etc.) so the agent can answer
+    very specific follow-up questions.
+
+    Args:
+        row: A single laptop record.
+
+    Returns:
+        A deeply nested dict with all available specs.
+    """
     return {
         "brand": row.get("Brand", ""),
         "model": row.get("Model", ""),
@@ -676,7 +856,18 @@ def _full_laptop_detail(row: dict) -> dict:
 
 
 def _recommendation_reason(row: dict, intent: str) -> str:
-    """Generate a human-readable reason why this laptop is recommended."""
+    """Generate a human-readable, sales-friendly reason *why* a laptop is being recommended.
+
+    The message is tailored to the usage intent so the agent can explain
+    its suggestion in plain language.
+
+    Args:
+        row: A single laptop record.
+        intent: The usage category the recommendation was made for.
+
+    Returns:
+        A sentence fragment (e.g. ``"Dedicated gaming GPU; 16 GB RAM for smooth gaming."``).
+    """
     reasons = []
     price = row["_price"]
 
